@@ -22,16 +22,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include "become_daemon.h"
-// For sockets
-#include <sys/un.h>
-#include <sys/socket.h>
-#include <ctype.h>
-//for poll - requires <time.h> as well
-#include <poll.h>
 
-#define BUF_SIZE 64 	/* Maximum size of messages exchanged between client
-							and server */
-#define SV_SOCK_PATH "/tmp/soc_leylogd"
 /**************************** LOGGING FUNCTIONS  **************/
 /****** Static File Pointers ******/
 static FILE *logfp;		/* Log file stream */
@@ -82,20 +73,40 @@ static void logClose(void)
 	logMessage("Closing log file");
 	fclose(logfp);
 }
-static void readConfigFile(const char *configFilename)
+/**************************************************************/
+
+/**************** CONFIGURATION HANDLERS **********************/
+static void readConfigFile(const char *configFilename, int *config)
 {
 	FILE *configfp;
 #define SBUF_SIZE 100
 	char str[SBUF_SIZE];
 
 	configfp = fopen(configFilename, "r");
-	if(configfp != NULL) {	/* Ignore nonexistent file */
-		if (fgets(str, SBUF_SIZE, configfp) == NULL)
-			str[0] = '\0';
-		else
-			str[strlen(str) - 1] = '\0';	/* Strip tailing */
-		logMessage("Read config file: %s", str);
+	if(configfp != NULL && fgets(str, SBUF_SIZE, configfp) != NULL) {	/* Ignore nonexistent file */
+		sscanf(str,"%*s %d%*c %*s %d",&config[0],&config[1]);
+		logMessage("Read config file: %d, %d", config[0],config[1]);
 		fclose(configfp);
+	} else {
+		logMessage("Couldn't open and/or read log file");
+		//Defaults
+		config[0] = 30;
+		config[1] = 1;
+	}
+}
+/**************************************************************/
+
+/************************ TIMER HANDLER ***********************/
+static int setTimer(struct itimerval *itv, int *config)
+{
+	itv->it_value.tv_sec = config[0];
+	itv->it_value.tv_usec = config[1];
+	itv->it_interval.tv_sec = config[0];
+	itv->it_interval.tv_usec = config[1];
+	if (setitimer(ITIMER_REAL, itv, 0) == -1){
+		return -1;
+	} else {
+		return 0;
 	}
 }
 /**************************************************************/
@@ -151,8 +162,9 @@ int main(int argc, char *argv[])
 	}
 
 /* Open Log file */
+	int config[2];
 	logOpen(LOG_FILE);
-	readConfigFile(CONFIG_FILE);
+	readConfigFile(CONFIG_FILE,config);
 	int count;
 	if (argc > 1){
 		for(count = 1; count < argc; count++){
@@ -163,47 +175,11 @@ int main(int argc, char *argv[])
 /* Set up Timer */
 	struct itimerval itv;
 	/* Set timer values*/
-	int sampling_period_s = 30;
-	int sampling_period_us = 0;
-	 itv.it_value.tv_sec = sampling_period_s;
-	 itv.it_value.tv_usec = sampling_period_us;
-	 itv.it_interval.tv_sec = sampling_period_s;
-	 itv.it_interval.tv_usec = sampling_period_us;
-	if (setitimer(ITIMER_REAL, &itv, 0) == -1){
-			logMessage("Timer Failure");
-			exit(EXIT_FAILURE);
-		 }
-
-/* Socket server setup */
-	struct sockaddr_un svaddr, claddr;
-	int socketfd; // socket file discription
-	ssize_t numBytes;
-	socklen_t len;
-	char buf[BUF_SIZE];
-	socketfd = socket(AF_UNIX, SOCK_DGRAM, 0);       /* Create UNIX server socket */
-
-	if (socketfd == -1){
-		logMessage("Socket creation failure");
+	if(setTimer(&itv,config) == -1){
+		logMessage("Fatal Timer error!");
 		exit(EXIT_FAILURE);
 	}
 
-	if (remove(SV_SOCK_PATH) == -1){
-		/* Construct well-known address and bind server socket to it */
-		logMessage("Error: remove-%s", SV_SOCK_PATH);
-	}
-	memset(&svaddr, 0, sizeof(struct sockaddr_un));
-	svaddr.sun_family = AF_UNIX;
-	strncpy(svaddr.sun_path, SV_SOCK_PATH, sizeof(svaddr.sun_path) - 1);
-
-	if (bind(socketfd, (struct sockaddr *) &svaddr, sizeof(struct sockaddr_un)) == -1){
-		logMessage("Error: Binding");
-		exit(EXIT_FAILURE);
-	}
-/* Poll Setup */
-	struct pollfd poller_fd;
-	int data_available = 0;
-	poller_fd.fd = socketfd;
-	poller_fd.events = POLLIN;
 
 	/* Final Message b4 loop*/
 	logMessage("Initialised");
@@ -220,27 +196,14 @@ int main(int argc, char *argv[])
 			//TODO Data logging
 		}else if(hupReceived != 0){
 			logMessage("Hang-up Received");
-			readConfigFile(CONFIG_FILE);
-			hupReceived = 0;
-			//TODO Re-initialise parameters
-		}else{
-			int timeout = (int) (sampling_period_s*1000/2); // timeout for half the sampling period
-			logMessage("Value of timeout %6.2f",timeout);
-			data_available = poll(&poller_fd, 1, timeout);
-			if (data_available != 0){
-				if(data_available == -1){
-					logMessage("Poll Error");
-				} else {
-					len = sizeof(struct sockaddr_un);
-					numBytes = recvfrom(socketfd, buf, BUF_SIZE, 0,
-						        		(struct sockaddr *) &claddr, &len);
-					if(numBytes == -1){
-						logMessage("Read Error");
-					} else {
-						logMessage("Server received: %s",numBytes);
-					}
-				}
+			readConfigFile(CONFIG_FILE,config);
+			// Reinitialise Parameters
+			if(setTimer(&itv,config) == -1){
+				logMessage("Fatal Timer error!");
+				exit(EXIT_FAILURE);
 			}
+			hupReceived = 0;
+		}else{
 			pause(); /* suspend until a signal is received.*/
 		}
 	}
